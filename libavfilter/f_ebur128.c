@@ -28,7 +28,11 @@
 
 #include <float.h>
 #include <math.h>
+#include "config.h"
+
+#if HAVE_AVX2_EXTERNAL && HAVE_AVX2 && HAVE_FMA3 
 #include <immintrin.h>
+#endif
 #include "libavutil/avassert.h"
 #include "libavutil/channel_layout.h"
 #include "libavutil/dict.h"
@@ -637,7 +641,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *insamples)
     const double *samples = (double *)insamples->data[0];
     AVFrame *pic;
         
-#if  defined(__AVX2__) && defined(__FMA__)
+#if HAVE_AVX2_EXTERNAL && HAVE_AVX2
         double bin[4];
         __m256d pre_b_0,pre_b_1,pre_b_2,pre_a_1,pre_a_2,rlb_b_0,rlb_b_1,rlb_b_2,rlb_a_1,rlb_a_2,x1,x2,x0,y1,y2,y0,z1,z2,z0; //
 
@@ -725,7 +729,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *insamples)
         MOVE_TO_NEXT_CACHED_ENTRY(400);
         MOVE_TO_NEXT_CACHED_ENTRY(3000);
         
-#if defined(__AVX2__) && defined(__FMA__) //performs filter computation in paraellel for the first 4 channels of the audio file  
+#if HAVE_AVX2_EXTERNAL && HAVE_AVX2 //performs filter computation in paraellel for the first 4 channels of the audio file  
         for (ch = 0; ch < MIN(4,nb_channels); ch++) {
             if (ebur128->peak_mode & PEAK_MODE_SAMPLES_PEAKS){
                 ebur128->sample_peaks[ch] = FFMAX(ebur128->sample_peaks[0], fabs(samples[idx_insample * nb_channels ]));
