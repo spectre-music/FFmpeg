@@ -7708,7 +7708,10 @@ elif enabled_any msvc icl; then
     test_cpp_condition windows.h "_MSC_FULL_VER >= 190023918" &&
         add_cflags -utf-8
 fi
-
+if enabled avx2 && enabled fma3; then
+        add_cflags -mavx2 
+        add_cflags -mfma        
+fi
 for pfx in "" host_; do
     varname=${pfx%_}cc_type
     eval "type=\$$varname"
