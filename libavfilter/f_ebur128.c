@@ -28,7 +28,7 @@
 
 #include <float.h>
 #include <math.h>
-
+#include "libavutil/intmath.h"
 #include "libavutil/avassert.h"
 #include "libavutil/channel_layout.h"
 #include "libavutil/dict.h"
@@ -199,7 +199,7 @@ static const AVOption ebur128_options[] = {
 };
 
 AVFILTER_DEFINE_CLASS(ebur128);
-
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
 static const uint8_t graph_colors[] = {
     0xdd, 0x66, 0x66,   // value above 1LU non reached below -1LU (impossible)
     0x66, 0x66, 0xdd,   // value below 1LU non reached below -1LU
@@ -628,13 +628,61 @@ static int gate_update(struct integrator *integ, double power,
 
 static int filter_frame(AVFilterLink *inlink, AVFrame *insamples)
 {
-    int i, ch, idx_insample, ret;
+
+    int i, ch, idx_insample, ret,bin_id_400,bin_id_3000;
     AVFilterContext *ctx = inlink->dst;
     EBUR128Context *ebur128 = ctx->priv;
     const int nb_channels = ebur128->nb_channels;
     const int nb_samples  = insamples->nb_samples;
     const double *samples = (double *)insamples->data[0];
     AVFrame *pic;
+        
+#if HAVE_AVX2_EXTERNAL && HAVE_AVX2
+        double bin[4];
+        __m256d pre_b_0,pre_b_1,pre_b_2,pre_a_1,pre_a_2,rlb_b_0,rlb_b_1,rlb_b_2,rlb_a_1,rlb_a_2,x1,x2,x0,y1,y2,y0,z1,z2,z0; //
+
+        /**
+         * Set each coeeficients value of pre_b,pre_a,rlb_b, rlb_a as vector variable of size 4, each element
+         * of the vectors corresponds to a channel, here we coded the case where there is 2 channel to deal with, case where nb_channel =3 or 
+         * 4 can easily be implemented following the exact same methodology
+         */
+
+        // Case where nb_channel = 3 : pre_b_0 = _mm256_setr_ps(ebur128->pre_b[0],ebur128->pre_b[0], ebur128->pre_b[0], 0.0);
+        bin[0] = 0.0;
+        bin[1] = 0.0;
+        bin[2] = 0.0;
+        bin[3] = 0.0;
+
+        // Load pre_b coefficients in 3 4*64 bits vector
+        pre_b_0 = _mm256_set1_pd(ebur128->pre_b[0]);
+        pre_b_1 = _mm256_set1_pd(ebur128->pre_b[1]);
+        pre_b_2 = _mm256_set1_pd(ebur128->pre_b[2]);
+
+        // Load pre_a coefficients in 2 4*64 bits vector pre_a_0 is not used here so no need to lad it
+        pre_a_1 = _mm256_set1_pd(ebur128->pre_a[1]);
+        pre_a_2 = _mm256_set1_pd(ebur128->pre_a[2]);
+
+        // Load rlb_b 
+        rlb_b_0 = _mm256_set1_pd(ebur128->rlb_b[0]);
+        rlb_b_1 = _mm256_set1_pd(ebur128->rlb_b[1]);
+        rlb_b_2 = _mm256_set1_pd(ebur128->rlb_b[2]);
+
+        // Load rlb_a
+        rlb_a_1 = _mm256_set1_pd(ebur128->rlb_a[1]);
+        rlb_a_2 = _mm256_set1_pd(ebur128->rlb_a[2]);
+
+        // At the start all the buffer filter are set at 0 in the start
+        x1 = _mm256_set1_pd(0.0);
+        x2 = _mm256_set1_pd(0.0);
+
+        y0 = _mm256_set1_pd(0.0);
+        y1 = _mm256_set1_pd(0.0);
+        y2 = _mm256_set1_pd(0.0);
+
+        z0 =_mm256_set1_pd(0.0);
+        z1 = _mm256_set1_pd(0.0);
+        z2 = _mm256_set1_pd(0.0);
+#endif
 
 #if CONFIG_SWRESAMPLE
     if (ebur128->peak_mode & PEAK_MODE_TRUE_PEAKS && ebur128->idx_insample == 0) {
@@ -657,8 +705,8 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *insamples)
 #endif
 
     for (idx_insample = ebur128->idx_insample; idx_insample < nb_samples; idx_insample++) {
-        const int bin_id_400  = ebur128->i400.cache_pos;
-        const int bin_id_3000 = ebur128->i3000.cache_pos;
+        bin_id_400  = ebur128->i400.cache_pos;
+        bin_id_3000 = ebur128->i3000.cache_pos;
 
 #define MOVE_TO_NEXT_CACHED_ENTRY(time) do {                \
     ebur128->i##time.cache_pos++;                           \
@@ -671,46 +719,180 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *insamples)
 
         MOVE_TO_NEXT_CACHED_ENTRY(400);
         MOVE_TO_NEXT_CACHED_ENTRY(3000);
+        
+#if HAVE_AVX2_EXTERNAL && HAVE_AVX2
+        // Performs filter computation in parallel for the first 4 channels of the audio file
+        for (ch = 0; ch < MIN(4,nb_channels); ch++) {
+            if (ebur128->peak_mode & PEAK_MODE_SAMPLES_PEAKS){
+                ebur128->sample_peaks[ch] = FFMAX(ebur128->sample_peaks[0], fabs(samples[idx_insample * nb_channels ]));
+            }
+                bin[ch] = samples[idx_insample * nb_channels +ch ];
+        }
 
-        for (ch = 0; ch < nb_channels; ch++) {
-            double bin;
+        // Initialise x0
+        x0 = _mm256_setr_pd(bin[0],bin[1], bin[2],bin[3]);  
+        y2 = y1;
+        y1 = y0;
+        y0 = _mm256_fmadd_pd(x0,pre_b_0,_mm256_fmadd_pd(x1,pre_b_1,_mm256_fmadd_pd(x2,pre_b_2,_mm256_fnmsub_pd(y1,pre_a_1,_mm256_mul_pd(y2,pre_a_2)))));
 
+
+        x2 = x1;
+        x1 = x0;
+
+        z2 = z1;
+        z1 = z0;
+
+        z0 = _mm256_fmadd_pd(y0,rlb_b_0,_mm256_fmadd_pd(y1,rlb_b_1,_mm256_fmadd_pd(y2,rlb_b_2,_mm256_fnmsub_pd(z1,rlb_a_1,_mm256_mul_pd(z2,rlb_a_2)))));
+           
+
+        // Retrieve the filtered values stored in Z0, bin[i] gets the value corresponding to the channel i      
+        _mm256_store_pd(bin, _mm256_mul_pd(z0, z0));
+
+
+
+        /**
+         * Add the new value, and limit the sum to the cache size (400ms or 3s)
+         * by removing the oldest one
+         * update sum and cache, demanding on the number of channel
+         */
+        switch(nb_channels){
+            case 1: 
+
+                ebur128->i400.sum [0] = ebur128->i400.sum [0] + bin[0] - ebur128->i400.cache [0][bin_id_400];
+                ebur128->i3000.sum[0] = ebur128->i3000.sum[0] + bin[0] - ebur128->i3000.cache[0][bin_id_3000];
+                ebur128->i400.cache [0][bin_id_400 ] = bin[0];
+                ebur128->i3000.cache[0][bin_id_3000] = bin[0];
+                break;
+            case 2: 
+
+                ebur128->i400.sum [0] = ebur128->i400.sum [0] + bin[0] - ebur128->i400.cache [0][bin_id_400];
+                ebur128->i3000.sum[0] = ebur128->i3000.sum[0] + bin[0] - ebur128->i3000.cache[0][bin_id_3000];
+
+                ebur128->i400.cache [0][bin_id_400 ] = bin[0];
+                ebur128->i3000.cache[0][bin_id_3000] = bin[0];
+
+                ebur128->i400.sum [1] = ebur128->i400.sum [1] + bin[1] - ebur128->i400.cache [1][bin_id_400];
+                ebur128->i3000.sum[1] = ebur128->i3000.sum[1] + bin[1] - ebur128->i3000.cache[1][bin_id_3000];
+
+
+                ebur128->i400.cache [1][bin_id_400 ] = bin[1];
+                ebur128->i3000.cache[1][bin_id_3000] = bin[1];
+                break;
+
+            case 3:
+
+                ebur128->i400.sum [0] = ebur128->i400.sum [0] + bin[0] - ebur128->i400.cache [0][bin_id_400];
+                ebur128->i3000.sum[0] = ebur128->i3000.sum[0] + bin[0] - ebur128->i3000.cache[0][bin_id_3000];
+                ebur128->i400.cache [0][bin_id_400 ] = bin[0];
+                ebur128->i3000.cache[0][bin_id_3000] = bin[0];
+
+                ebur128->i400.sum [1] = ebur128->i400.sum [1] + bin[1] - ebur128->i400.cache [1][bin_id_400];
+                ebur128->i3000.sum[1] = ebur128->i3000.sum[1] + bin[1] - ebur128->i3000.cache[1][bin_id_3000];
+                ebur128->i400.cache [1][bin_id_400 ] = bin[1];
+                ebur128->i3000.cache[1][bin_id_3000] = bin[1];
+
+                ebur128->i400.sum [2] = ebur128->i400.sum [2] + bin[2] - ebur128->i400.cache [2][bin_id_400];
+                ebur128->i3000.sum[2] = ebur128->i3000.sum[2] + bin[2] - ebur128->i3000.cache[2][bin_id_3000];
+                ebur128->i400.cache [2][bin_id_400 ] = bin[2];
+                ebur128->i3000.cache[2][bin_id_3000] = bin[2];
+                break;
+
+            default :
+                ebur128->i400.sum[0] = ebur128->i400.sum [0] + bin[0] - ebur128->i400.cache [0][bin_id_400];
+                ebur128->i3000.sum[0] = ebur128->i3000.sum[0] + bin[0] - ebur128->i3000.cache[0][bin_id_3000];
+                ebur128->i400.cache[0][bin_id_400 ] = bin[0];
+                ebur128->i3000.cache[0][bin_id_3000] = bin[0];
+
+                ebur128->i400.sum[1] = ebur128->i400.sum [1] + bin[1] - ebur128->i400.cache [1][bin_id_400];
+                ebur128->i3000.sum[1] = ebur128->i3000.sum[1] + bin[1] - ebur128->i3000.cache[1][bin_id_3000];
+                ebur128->i400.cache[1][bin_id_400 ] = bin[1];
+                ebur128->i3000.cache[1][bin_id_3000] = bin[1];
+
+                ebur128->i400.sum[2] = ebur128->i400.sum [2] + bin[2] - ebur128->i400.cache [2][bin_id_400];
+                ebur128->i3000.sum[2] = ebur128->i3000.sum[2] + bin[2] - ebur128->i3000.cache[2][bin_id_3000];
+                ebur128->i400.cache[2][bin_id_400 ] = bin[2];
+                ebur128->i3000.cache[2][bin_id_3000] = bin[2];
+
+                ebur128->i400.sum[3] = ebur128->i400.sum [3] + bin[3] - ebur128->i400.cache [3][bin_id_400];
+                ebur128->i3000.sum[3] = ebur128->i3000.sum[3] + bin[3] - ebur128->i3000.cache[3][bin_id_3000];
+                ebur128->i400.cache [3][bin_id_400 ] = bin[3];
+                ebur128->i3000.cache[3][bin_id_3000] = bin[3];
+                break;
+        }
+        // Use the classic version to compute data from the remainings channels
+        for (ch = 4; ch < nb_channels; ch++) {
+            double bin2;
             if (ebur128->peak_mode & PEAK_MODE_SAMPLES_PEAKS)
                 ebur128->sample_peaks[ch] = FFMAX(ebur128->sample_peaks[ch], fabs(samples[idx_insample * nb_channels + ch]));
 
             ebur128->x[ch * 3] = samples[idx_insample * nb_channels + ch]; // set X[i]
+            if (!ebur128->ch_weighting[ch])
+                continue;
+                
+    #define FILTER(Y, X, NUM, DEN) do {                                             \
+                double *dst = ebur128->Y + ch*3;                                    \
+                double *src = ebur128->X + ch*3;                                    \
+                dst[2] = dst[1];                                                    \
+                dst[1] = dst[0];                                                    \
+                dst[0] = src[0]*NUM[0] + src[1]*NUM[1] + src[2]*NUM[2]              \
+                                       - dst[1]*DEN[1] - dst[2]*DEN[2];             \
+    } while (0)
+
+                // TODO: merge both filters in one?
+                FILTER(y, x, ebur128->pre_b, ebur128->pre_a);  // apply pre-filter
+                ebur128->x[ch * 3 + 2] = ebur128->x[ch * 3 + 1];
+                ebur128->x[ch * 3 + 1] = ebur128->x[ch * 3    ];
+                FILTER(z, y, ebur128->rlb_b, ebur128->rlb_a);  // apply RLB-filter
+
+                bin2 = ebur128->z[ch * 3] * ebur128->z[ch * 3];
+
+                /* Add the new value, and limit the sum to the cache size (400ms or 3s)
+                 * by removing the oldest one */
+                ebur128->i400.sum [ch] = ebur128->i400.sum [ch] + bin2 - ebur128->i400.cache [ch][bin_id_400];
+                ebur128->i3000.sum[ch] = ebur128->i3000.sum[ch] + bin2 - ebur128->i3000.cache[ch][bin_id_3000];
+
+                // Override old cache entry with the new value
+                ebur128->i400.cache [ch][bin_id_400 ] = bin2;
+                ebur128->i3000.cache[ch][bin_id_3000] = bin2;
+        }
+
+#else
+
+        for (ch = 0; ch < nb_channels; ch++) {
+            double bin;
+            if (ebur128->peak_mode & PEAK_MODE_SAMPLES_PEAKS)
+                ebur128->sample_peaks[ch] = FFMAX(ebur128->sample_peaks[ch], fabs(samples[idx_insample * nb_channels + ch]));
+
+            ebur128->x[ch * 3] = samples[idx_insample * nb_channels + ch]; // Set X[i]
 
             if (!ebur128->ch_weighting[ch])
                 continue;
+                
+    #define FILTER(Y, X, NUM, DEN) do {                                             \
+                double *dst = ebur128->Y + ch*3;                                    \
+                double *src = ebur128->X + ch*3;                                    \
+                dst[2] = dst[1];                                                    \
+                dst[1] = dst[0];                                                    \
+                dst[0] = src[0]*NUM[0] + src[1]*NUM[1] + src[2]*NUM[2]              \
+                                       - dst[1]*DEN[1] - dst[2]*DEN[2];             \
+    } while (0)
 
-            /* Y[i] = X[i]*b0 + X[i-1]*b1 + X[i-2]*b2 - Y[i-1]*a1 - Y[i-2]*a2 */
-#define FILTER(Y, X, NUM, DEN) do {                                             \
-            double *dst = ebur128->Y + ch*3;                                    \
-            double *src = ebur128->X + ch*3;                                    \
-            dst[2] = dst[1];                                                    \
-            dst[1] = dst[0];                                                    \
-            dst[0] = src[0]*NUM[0] + src[1]*NUM[1] + src[2]*NUM[2]              \
-                                   - dst[1]*DEN[1] - dst[2]*DEN[2];             \
-} while (0)
-
-            // TODO: merge both filters in one?
-            FILTER(y, x, ebur128->pre_b, ebur128->pre_a);  // apply pre-filter
-            ebur128->x[ch * 3 + 2] = ebur128->x[ch * 3 + 1];
-            ebur128->x[ch * 3 + 1] = ebur128->x[ch * 3    ];
-            FILTER(z, y, ebur128->rlb_b, ebur128->rlb_a);  // apply RLB-filter
-
-            bin = ebur128->z[ch * 3] * ebur128->z[ch * 3];
-
-            /* add the new value, and limit the sum to the cache size (400ms or 3s)
-             * by removing the oldest one */
-            ebur128->i400.sum [ch] = ebur128->i400.sum [ch] + bin - ebur128->i400.cache [ch][bin_id_400];
-            ebur128->i3000.sum[ch] = ebur128->i3000.sum[ch] + bin - ebur128->i3000.cache[ch][bin_id_3000];
-
-            /* override old cache entry with the new value */
-            ebur128->i400.cache [ch][bin_id_400 ] = bin;
-            ebur128->i3000.cache[ch][bin_id_3000] = bin;
+                // TODO: merge both filters in one?
+                FILTER(y, x, ebur128->pre_b, ebur128->pre_a);  // Apply pre-filter
+                ebur128->x[ch * 3 + 2] = ebur128->x[ch * 3 + 1];
+                ebur128->x[ch * 3 + 1] = ebur128->x[ch * 3    ];
+                FILTER(z, y, ebur128->rlb_b, ebur128->rlb_a);  // Apply RLB-filter
+                bin = ebur128->z[ch * 3] * ebur128->z[ch * 3];
+                /* Add the new value, and limit the sum to the cache size (400ms or 3s)
+                 * by removing the oldest one */
+                ebur128->i400.sum [ch] = ebur128->i400.sum [ch] + bin - ebur128->i400.cache [ch][bin_id_400];
+                ebur128->i3000.sum[ch] = ebur128->i3000.sum[ch] + bin - ebur128->i3000.cache[ch][bin_id_3000];
+                // Override old cache entry with the new value
+                ebur128->i400.cache [ch][bin_id_400 ] = bin;
+                ebur128->i3000.cache[ch][bin_id_3000] = bin;
         }
-
+#endif
+        
 #define FIND_PEAK(global, sp, ptype) do {                        \
     int ch;                                                      \
     double maxpeak;                                              \
