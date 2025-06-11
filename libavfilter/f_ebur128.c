@@ -28,7 +28,7 @@
 
 #include <float.h>
 #include <math.h>
-
+#include "libavutil/intmath.h"
 #include "libavutil/avassert.h"
 #include "libavutil/channel_layout.h"
 #include "libavutil/dict.h"
@@ -42,6 +42,7 @@
 #include "filters.h"
 #include "formats.h"
 #include "video.h"
+#include "f_ebur128.h"
 
 #define ABS_THRES    -70            ///< silence gate: we discard anything below this absolute (LUFS) threshold
 #define ABS_UP_THRES  10            ///< upper loud limit to consider (ABS_THRES being the minimum)
@@ -55,97 +56,6 @@
  * This fixed-size system avoids the need of a list of energies growing
  * infinitely over the time and is thus more scalable.
  */
-struct hist_entry {
-    unsigned count;                 ///< how many times the corresponding value occurred
-    double energy;                  ///< E = 10^((L + 0.691) / 10)
-    double loudness;                ///< L = -0.691 + 10 * log10(E)
-};
-
-struct integrator {
-    double **cache;                 ///< window of filtered samples (N ms)
-    int cache_pos;                  ///< focus on the last added bin in the cache array
-    int cache_size;
-    double *sum;                    ///< sum of the last N ms filtered samples (cache content)
-    int filled;                     ///< 1 if the cache is completely filled, 0 otherwise
-    double rel_threshold;           ///< relative threshold
-    double sum_kept_powers;         ///< sum of the powers (weighted sums) above absolute threshold
-    int nb_kept_powers;             ///< number of sum above absolute threshold
-    struct hist_entry *histogram;   ///< histogram of the powers, used to compute LRA and I
-};
-
-struct rect { int x, y, w, h; };
-
-typedef struct EBUR128Context {
-    const AVClass *class;           ///< AVClass context for log and options purpose
-
-    /* peak metering */
-    int peak_mode;                  ///< enabled peak modes
-    double true_peak;               ///< global true peak
-    double *true_peaks;             ///< true peaks per channel
-    double sample_peak;             ///< global sample peak
-    double *sample_peaks;           ///< sample peaks per channel
-    double *true_peaks_per_frame;   ///< true peaks in a frame per channel
-#if CONFIG_SWRESAMPLE
-    SwrContext *swr_ctx;            ///< over-sampling context for true peak metering
-    double *swr_buf;                ///< resampled audio data for true peak metering
-    int swr_linesize;
-#endif
-
-    /* video  */
-    int do_video;                   ///< 1 if video output enabled, 0 otherwise
-    int w, h;                       ///< size of the video output
-    struct rect text;               ///< rectangle for the LU legend on the left
-    struct rect graph;              ///< rectangle for the main graph in the center
-    struct rect gauge;              ///< rectangle for the gauge on the right
-    AVFrame *outpicref;             ///< output picture reference, updated regularly
-    int meter;                      ///< select a EBU mode between +9 and +18
-    int scale_range;                ///< the range of LU values according to the meter
-    int y_zero_lu;                  ///< the y value (pixel position) for 0 LU
-    int y_opt_max;                  ///< the y value (pixel position) for 1 LU
-    int y_opt_min;                  ///< the y value (pixel position) for -1 LU
-    int *y_line_ref;                ///< y reference values for drawing the LU lines in the graph and the gauge
-
-    /* audio */
-    int nb_channels;                ///< number of channels in the input
-    double *ch_weighting;           ///< channel weighting mapping
-    int sample_count;               ///< sample count used for refresh frequency, reset at refresh
-    int nb_samples;                 ///< number of samples to consume per single input frame
-    int idx_insample;               ///< current sample position of processed samples in single input frame
-    AVFrame *insamples;             ///< input samples reference, updated regularly
-
-    /* Filter caches.
-     * The mult by 3 in the following is for X[i], X[i-1] and X[i-2] */
-    double *x;                      ///< 3 input samples cache for each channel
-    double *y;                      ///< 3 pre-filter samples cache for each channel
-    double *z;                      ///< 3 RLB-filter samples cache for each channel
-    double pre_b[3];                ///< pre-filter numerator coefficients
-    double pre_a[3];                ///< pre-filter denominator coefficients
-    double rlb_b[3];                ///< rlb-filter numerator coefficients
-    double rlb_a[3];                ///< rlb-filter denominator coefficients
-
-    struct integrator i400;         ///< 400ms integrator, used for Momentary loudness  (M), and Integrated loudness (I)
-    struct integrator i3000;        ///<    3s integrator, used for Short term loudness (S), and Loudness Range      (LRA)
-
-    /* I and LRA specific */
-    double integrated_loudness;     ///< integrated loudness in LUFS (I)
-    double loudness_range;          ///< loudness range in LU (LRA)
-    double lra_low, lra_high;       ///< low and high LRA values
-
-    /* misc */
-    int loglevel;                   ///< log level for frame logging
-    int metadata;                   ///< whether or not to inject loudness results in frames
-    int dual_mono;                  ///< whether or not to treat single channel input files as dual-mono
-    double pan_law;                 ///< pan law value used to calculate dual-mono measurements
-    int target;                     ///< target level in LUFS used to set relative zero LU in visualization
-    int gauge_type;                 ///< whether gauge shows momentary or short
-    int scale;                      ///< display scale type of statistics
-} EBUR128Context;
-
-enum {
-    PEAK_MODE_NONE          = 0,
-    PEAK_MODE_SAMPLES_PEAKS = 1<<1,
-    PEAK_MODE_TRUE_PEAKS    = 1<<2,
-};
 
 enum {
     GAUGE_TYPE_MOMENTARY = 0,
@@ -199,7 +109,7 @@ static const AVOption ebur128_options[] = {
 };
 
 AVFILTER_DEFINE_CLASS(ebur128);
-
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
 static const uint8_t graph_colors[] = {
     0xdd, 0x66, 0x66,   // value above 1LU non reached below -1LU (impossible)
     0x66, 0x66, 0xdd,   // value below 1LU non reached below -1LU
@@ -540,6 +450,48 @@ static struct hist_entry *get_histogram(void)
     return h;
 }
 
+static void ebur128_filter_c(EBUR128Context *ebur128, const double *samples,
+                             int idx_insample, int nb_channels, int nb_samples)
+{
+    int ch;
+    const int bin_id_400  = ebur128->i400.cache_pos;
+    const int bin_id_3000 = ebur128->i3000.cache_pos;
+
+    for (ch = 0; ch < nb_channels; ch++) {
+        double bin;
+        if (ebur128->peak_mode & PEAK_MODE_SAMPLES_PEAKS)
+            ebur128->sample_peaks[ch] = FFMAX(ebur128->sample_peaks[ch], fabs(samples[idx_insample * nb_channels + ch]));
+
+        ebur128->x[ch * 3] = samples[idx_insample * nb_channels + ch]; // Set X[i]
+
+        if (!ebur128->ch_weighting[ch])
+            continue;
+            
+#define FILTER(Y, X, NUM, DEN) do {                                             \
+            double *dst = ebur128->Y + ch*3;                                    \
+            double *src = ebur128->X + ch*3;                                    \
+            dst[2] = dst[1];                                                    \
+            dst[1] = dst[0];                                                    \
+            dst[0] = src[0]*NUM[0] + src[1]*NUM[1] + src[2]*NUM[2]              \
+                                   - dst[1]*DEN[1] - dst[2]*DEN[2];             \
+} while (0)
+
+            // TODO: merge both filters in one?
+            FILTER(y, x, ebur128->pre_b, ebur128->pre_a);  // Apply pre-filter
+            ebur128->x[ch * 3 + 2] = ebur128->x[ch * 3 + 1];
+            ebur128->x[ch * 3 + 1] = ebur128->x[ch * 3    ];
+            FILTER(z, y, ebur128->rlb_b, ebur128->rlb_a);  // Apply RLB-filter
+            bin = ebur128->z[ch * 3] * ebur128->z[ch * 3];
+            /* Add the new value, and limit the sum to the cache size (400ms or 3s)
+             * by removing the oldest one */
+            ebur128->i400.sum[ch] = ebur128->i400.sum[ch] + bin - ebur128->i400.cache[ch][bin_id_400];
+            ebur128->i3000.sum[ch] = ebur128->i3000.sum[ch] + bin - ebur128->i3000.cache[ch][bin_id_3000];
+            // Override old cache entry with the new value
+            ebur128->i400.cache[ch][bin_id_400] = bin;
+            ebur128->i3000.cache[ch][bin_id_3000] = bin;
+    }
+}
+
 static av_cold int init(AVFilterContext *ctx)
 {
     EBUR128Context *ebur128 = ctx->priv;
@@ -573,6 +525,12 @@ static av_cold int init(AVFilterContext *ctx)
     ebur128->integrated_loudness = ABS_THRES;
     ebur128->loudness_range = 0;
 
+    /* Initialize default DSP function pointer */
+    ebur128->ebur128_filter = ebur128_filter_c;
+
+    /* Initialize optimized DSP functions */
+    ff_ebur128_init_x86(ebur128);
+
     /* insert output pads */
     if (ebur128->do_video) {
         pad = (AVFilterPad){
@@ -598,6 +556,12 @@ static av_cold int init(AVFilterContext *ctx)
 
     return 0;
 }
+
+#if !ARCH_X86
+void ff_ebur128_init_x86(EBUR128Context *ebur128)
+{
+}
+#endif
 
 #define HIST_POS(power) (int)(((power) - ABS_THRES) * HIST_GRAIN)
 
@@ -625,6 +589,7 @@ static int gate_update(struct integrator *integ, double power,
 
     return gate_hist_pos;
 }
+
 
 static int filter_frame(AVFilterLink *inlink, AVFrame *insamples)
 {
@@ -657,9 +622,6 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *insamples)
 #endif
 
     for (idx_insample = ebur128->idx_insample; idx_insample < nb_samples; idx_insample++) {
-        const int bin_id_400  = ebur128->i400.cache_pos;
-        const int bin_id_3000 = ebur128->i3000.cache_pos;
-
 #define MOVE_TO_NEXT_CACHED_ENTRY(time) do {                \
     ebur128->i##time.cache_pos++;                           \
     if (ebur128->i##time.cache_pos ==                       \
@@ -671,46 +633,9 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *insamples)
 
         MOVE_TO_NEXT_CACHED_ENTRY(400);
         MOVE_TO_NEXT_CACHED_ENTRY(3000);
-
-        for (ch = 0; ch < nb_channels; ch++) {
-            double bin;
-
-            if (ebur128->peak_mode & PEAK_MODE_SAMPLES_PEAKS)
-                ebur128->sample_peaks[ch] = FFMAX(ebur128->sample_peaks[ch], fabs(samples[idx_insample * nb_channels + ch]));
-
-            ebur128->x[ch * 3] = samples[idx_insample * nb_channels + ch]; // set X[i]
-
-            if (!ebur128->ch_weighting[ch])
-                continue;
-
-            /* Y[i] = X[i]*b0 + X[i-1]*b1 + X[i-2]*b2 - Y[i-1]*a1 - Y[i-2]*a2 */
-#define FILTER(Y, X, NUM, DEN) do {                                             \
-            double *dst = ebur128->Y + ch*3;                                    \
-            double *src = ebur128->X + ch*3;                                    \
-            dst[2] = dst[1];                                                    \
-            dst[1] = dst[0];                                                    \
-            dst[0] = src[0]*NUM[0] + src[1]*NUM[1] + src[2]*NUM[2]              \
-                                   - dst[1]*DEN[1] - dst[2]*DEN[2];             \
-} while (0)
-
-            // TODO: merge both filters in one?
-            FILTER(y, x, ebur128->pre_b, ebur128->pre_a);  // apply pre-filter
-            ebur128->x[ch * 3 + 2] = ebur128->x[ch * 3 + 1];
-            ebur128->x[ch * 3 + 1] = ebur128->x[ch * 3    ];
-            FILTER(z, y, ebur128->rlb_b, ebur128->rlb_a);  // apply RLB-filter
-
-            bin = ebur128->z[ch * 3] * ebur128->z[ch * 3];
-
-            /* add the new value, and limit the sum to the cache size (400ms or 3s)
-             * by removing the oldest one */
-            ebur128->i400.sum [ch] = ebur128->i400.sum [ch] + bin - ebur128->i400.cache [ch][bin_id_400];
-            ebur128->i3000.sum[ch] = ebur128->i3000.sum[ch] + bin - ebur128->i3000.cache[ch][bin_id_3000];
-
-            /* override old cache entry with the new value */
-            ebur128->i400.cache [ch][bin_id_400 ] = bin;
-            ebur128->i3000.cache[ch][bin_id_3000] = bin;
-        }
-
+        
+        ebur128->ebur128_filter(ebur128, samples, idx_insample, nb_channels, nb_samples);
+        
 #define FIND_PEAK(global, sp, ptype) do {                        \
     int ch;                                                      \
     double maxpeak;                                              \
